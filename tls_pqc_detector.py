@@ -14,14 +14,17 @@ import sys
 import os
 from datetime import datetime
 from dataclasses import dataclass, asdict
-from typing import List, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional, Union, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 import threading
 from queue import Queue
 import time
 import re
 import contextlib
 import io
+import glob
+import multiprocessing as mp
+from pathlib import Path
 from config import (
     PQC_NAMED_GROUPS, CLASSICAL_NAMED_GROUPS, PQC_SIGNATURE_ALGORITHMS,
     CIPHER_SUITES, TLS_VERSION_PATTERNS, DEFAULT_WORKERS, 
@@ -57,6 +60,246 @@ class ClientHelloInfo:
     pqc_key_share: bool
     pqc_signature: bool
     pqc_any: bool  # Any PQC algorithm detected
+
+@dataclass
+class PcapProcessingResult:
+    """Processing result for a single pcap file"""
+    pcap_file: str
+    server_results: List[ServerHelloInfo]
+    client_results: List[ClientHelloInfo]
+    processing_time: float
+    error: Optional[str] = None
+
+class ParallelPcapProcessor:
+    """Parallel processing class for multiple pcap files"""
+    
+    def __init__(self, max_workers: int = 4, max_processes: int = None, 
+                 chunk_size: int = 50, buffer_size: int = 20000, 
+                 show_progress: bool = True):
+        self.max_workers = max_workers
+        self.max_processes = max_processes or min(mp.cpu_count(), 8)
+        self.chunk_size = chunk_size
+        self.buffer_size = buffer_size
+        self.show_progress = show_progress
+        
+    def process_single_pcap(self, pcap_file: str, frame_offset: int = 0, 
+                          mode: str = 'both') -> PcapProcessingResult:
+        """Process a single pcap file and apply frame number offset"""
+        start_time = time.time()
+        
+        try:
+            server_results = []
+            client_results = []
+            
+            if mode in ['server', 'both']:
+                server_results = run_pyshark_streaming(
+                    pcap_file, 
+                    max_workers=self.max_workers,
+                    show_progress=False,  # Hide individual progress
+                    chunk_size=self.chunk_size,
+                    buffer_size=self.buffer_size
+                )
+                # Apply frame number offset
+                for result in server_results:
+                    if result.frame is not None:
+                        result.frame += frame_offset
+            
+            if mode in ['client', 'both']:
+                client_results = run_pyshark_client_hello_streaming(
+                    pcap_file,
+                    max_workers=self.max_workers,
+                    show_progress=False,  # Hide individual progress
+                    chunk_size=self.chunk_size,
+                    buffer_size=self.buffer_size
+                )
+                # Apply frame number offset
+                for result in client_results:
+                    if result.frame is not None:
+                        result.frame += frame_offset
+            
+            processing_time = time.time() - start_time
+            
+            return PcapProcessingResult(
+                pcap_file=pcap_file,
+                server_results=server_results,
+                client_results=client_results,
+                processing_time=processing_time
+            )
+            
+        except Exception as e:
+            processing_time = time.time() - start_time
+            return PcapProcessingResult(
+                pcap_file=pcap_file,
+                server_results=[],
+                client_results=[],
+                processing_time=processing_time,
+                error=str(e)
+            )
+    
+    def process_multiple_pcaps(self, pcap_files: List[str], mode: str = 'both') -> List[PcapProcessingResult]:
+        """Process multiple pcap files in parallel"""
+        if not pcap_files:
+            return []
+        
+        if self.show_progress:
+            print(f"Processing {len(pcap_files)} pcap files with {self.max_processes} processes...", file=sys.stderr)
+            print(f"Files to process:", file=sys.stderr)
+            for i, pcap_file in enumerate(pcap_files, 1):
+                print(f"  {i}. {os.path.basename(pcap_file)}", file=sys.stderr)
+        
+        # Calculate frame number offsets (each pcap file starts from 1)
+        frame_offsets = {}
+        current_offset = 0
+        
+        for pcap_file in pcap_files:
+            frame_offsets[pcap_file] = current_offset
+            # Set large offset value (actual frame count is unknown)
+            current_offset += 1000000  # Assign 1 million offset to each pcap file
+        
+        
+        results = []
+        start_time = time.time()
+        
+        # Use process pool for parallel processing
+        with ProcessPoolExecutor(max_workers=self.max_processes) as executor:
+            # Schedule processing for each pcap file
+            future_to_pcap = {}
+            for pcap_file in pcap_files:
+                frame_offset = frame_offsets[pcap_file]
+                future = executor.submit(self._process_single_pcap_wrapper, 
+                                       pcap_file, frame_offset, mode)
+                future_to_pcap[future] = pcap_file
+            
+            # Collect results
+            completed = 0
+            for future in as_completed(future_to_pcap):
+                pcap_file = future_to_pcap[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    completed += 1
+                    
+                    if self.show_progress:
+                        elapsed = time.time() - start_time
+                        rate = completed / elapsed if elapsed > 0 else 0
+                        progress_percent = (completed / len(pcap_files)) * 100
+                        print(f"[{progress_percent:5.1f}%] Completed: {completed}/{len(pcap_files)} files "
+                              f"({rate:.1f} files/s) - {os.path.basename(pcap_file)}", 
+                              file=sys.stderr)
+                        
+                except Exception as e:
+                    error_result = PcapProcessingResult(
+                        pcap_file=pcap_file,
+                        server_results=[],
+                        client_results=[],
+                        processing_time=0,
+                        error=str(e)
+                    )
+                    results.append(error_result)
+                    completed += 1
+                    
+                    if self.show_progress:
+                        print(f"[ERROR] Failed to process {os.path.basename(pcap_file)}: {str(e)}", 
+                              file=sys.stderr)
+        
+        if self.show_progress:
+            total_time = time.time() - start_time
+            successful_files = len([r for r in results if not r.error])
+            failed_files = len([r for r in results if r.error])
+            print(f"Processing completed: {successful_files} successful, {failed_files} failed in {total_time:.1f}s", file=sys.stderr)
+        
+        return results
+    
+    @staticmethod
+    def _process_single_pcap_wrapper(pcap_file: str, frame_offset: int, mode: str) -> PcapProcessingResult:
+        """Wrapper function for inter-process communication"""
+        processor = ParallelPcapProcessor()
+        return processor.process_single_pcap(pcap_file, frame_offset, mode)
+    
+    def aggregate_results(self, results: List[PcapProcessingResult]) -> Tuple[List[ServerHelloInfo], List[ClientHelloInfo]]:
+        """Aggregate multiple processing results"""
+        all_server_results = []
+        all_client_results = []
+        
+        for result in results:
+            if result.error:
+                if self.show_progress:
+                    print(f"Error processing {result.pcap_file}: {result.error}", file=sys.stderr)
+                continue
+                
+            all_server_results.extend(result.server_results)
+            all_client_results.extend(result.client_results)
+        
+        return all_server_results, all_client_results
+
+def find_pcap_files(input_path: str) -> List[str]:
+    """Search for pcap files from input path"""
+    pcap_files = []
+    
+    if os.path.isfile(input_path):
+        # Single file
+        if input_path.lower().endswith(('.pcap', '.pcapng')):
+            pcap_files.append(input_path)
+    elif os.path.isdir(input_path):
+        # Search for pcap files in directory
+        patterns = ['*.pcap', '*.pcapng', '**/*.pcap', '**/*.pcapng']
+        for pattern in patterns:
+            pcap_files.extend(glob.glob(os.path.join(input_path, pattern), recursive=True))
+        pcap_files = sorted(list(set(pcap_files)))  # Remove duplicates and sort
+    else:
+        # Wildcard pattern
+        pcap_files = glob.glob(input_path)
+        pcap_files = [f for f in pcap_files if f.lower().endswith(('.pcap', '.pcapng'))]
+        pcap_files = list(set(pcap_files))  # Remove duplicates
+    
+    return pcap_files
+
+def process_pcap_files_batch(pcap_files: List[str], max_processes: int = None, 
+                           max_workers: int = 4, mode: str = 'both',
+                           chunk_size: int = 50, buffer_size: int = 20000,
+                           show_progress: bool = True) -> Tuple[List[ServerHelloInfo], List[ClientHelloInfo]]:
+    """Batch process multiple pcap files (large scale support)"""
+    if not pcap_files:
+        return [], []
+    
+    if show_progress:
+        print(f"Found {len(pcap_files)} pcap files to process", file=sys.stderr)
+    
+    # Adjust batch size for large number of files
+    batch_size = min(100, len(pcap_files))  # Number of files to process at once
+    all_server_results = []
+    all_client_results = []
+    
+    processor = ParallelPcapProcessor(
+        max_workers=max_workers,
+        max_processes=max_processes,
+        chunk_size=chunk_size,
+        buffer_size=buffer_size,
+        show_progress=show_progress
+    )
+    
+    # Batch processing
+    for i in range(0, len(pcap_files), batch_size):
+        batch_files = pcap_files[i:i + batch_size]
+        
+        if show_progress:
+            batch_num = i//batch_size + 1
+            total_batches = (len(pcap_files) + batch_size - 1)//batch_size
+            print(f"Processing batch {batch_num}/{total_batches} ({len(batch_files)} files)", file=sys.stderr)
+        
+        # Process files in batch in parallel
+        batch_results = processor.process_multiple_pcaps(batch_files, mode)
+        
+        # Aggregate results
+        batch_server_results, batch_client_results = processor.aggregate_results(batch_results)
+        all_server_results.extend(batch_server_results)
+        all_client_results.extend(batch_client_results)
+        
+        if show_progress:
+            print(f"Batch {batch_num}/{total_batches} completed: {len(batch_server_results)} ServerHello, "
+                  f"{len(batch_client_results)} ClientHello packets", file=sys.stderr)
+    
+    return all_server_results, all_client_results
 
 def _hex_to_int(s: str) -> Optional[int]:
     try:
@@ -550,7 +793,6 @@ def run_pyshark_client_hello_streaming(pcap: str, max_workers: int = 4, show_pro
                 batch_count += 1
                 
                 batch_futures = [executor.submit(process_client_hello_optimized, pkt, tls_version_patterns) for pkt in batch]
-                futures.extend(batch_futures)
                 
                 # Process futures without timeout to avoid blocking
                 for future in batch_futures:
@@ -567,15 +809,6 @@ def run_pyshark_client_hello_streaming(pcap: str, max_workers: int = 4, show_pro
                         elapsed = time.time() - start_time
                         rate = processed_count / elapsed if elapsed > 0 else 0
                         print(f"Processed: {processed_count} packets (Speed: {rate:.1f} pkt/s)", file=sys.stderr)
-            
-            for future in futures:
-                try:
-                    result = future.result(timeout=0.1)
-                    if result is not None:
-                        with results_lock:
-                            results.append(result)
-                except:
-                    pass
     
     if show_progress:
         print(f"Streaming ClientHello packets... (Chunk size: {chunk_size}, Workers: {max_workers})", file=sys.stderr)
@@ -674,7 +907,6 @@ def run_pyshark_streaming(pcap: str, max_workers: int = 4, show_progress: bool =
                 batch_count += 1
                 
                 batch_futures = [executor.submit(process_packet_optimized, pkt, tls_version_patterns) for pkt in batch]
-                futures.extend(batch_futures)
                 
                 # Process futures without timeout to avoid blocking
                 for future in batch_futures:
@@ -691,15 +923,6 @@ def run_pyshark_streaming(pcap: str, max_workers: int = 4, show_progress: bool =
                         elapsed = time.time() - start_time
                         rate = processed_count / elapsed if elapsed > 0 else 0
                         print(f"Processed: {processed_count} packets (Speed: {rate:.1f} pkt/s)", file=sys.stderr)
-            
-            for future in futures:
-                try:
-                    result = future.result(timeout=0.1)
-                    if result is not None:
-                        with results_lock:
-                            results.append(result)
-                except:
-                    pass
     
     if show_progress:
         print(f"Streaming packets... (Chunk size: {chunk_size}, Workers: {max_workers})", file=sys.stderr)
@@ -943,11 +1166,12 @@ def print_client_hello_statistics(results: List[ClientHelloInfo]) -> None:
     print("=" * 80)
 
 def main():
-    ap = argparse.ArgumentParser(description="Detect PQC usage from TLS packets in a pcap/pcapng.")
-    ap.add_argument("pcap", help="Input .pcap or .pcapng path")
+    ap = argparse.ArgumentParser(description="Detect PQC usage from TLS packets in pcap/pcapng files.")
+    ap.add_argument("input", help="Input .pcap/.pcapng file, directory, or wildcard pattern")
     ap.add_argument("--mode", choices=['server', 'client', 'both'], default=DEFAULT_MODE, 
                    help="Analysis mode: server (ServerHello), client (ClientHello), or both (default: both)")
-    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Number of parallel workers (default: 8)")
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Number of parallel workers per file (default: 8)")
+    ap.add_argument("--processes", type=int, default=None, help="Number of parallel processes for multiple files (default: CPU count)")
     ap.add_argument("--no-progress", action="store_true", help="Disable progress output")
     ap.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Chunk size for processing (default: 1000)")
     ap.add_argument("--buffer-size", type=int, default=DEFAULT_BUFFER_SIZE, help="Buffer size for packet queue (default: 20000)")
@@ -962,113 +1186,239 @@ def main():
     
     print(f"Results will be saved to: {results_dir}/", file=sys.stderr)
     
-    # Process ServerHello packets
-    if args.mode in ['server', 'both']:
+    # Find pcap files
+    pcap_files = find_pcap_files(args.input)
+    
+    if not pcap_files:
+        print(f"No pcap files found in: {args.input}", file=sys.stderr)
+        sys.exit(1)
+    
+    if len(pcap_files) == 1:
+        # Single file processing (maintain existing functionality)
+        if show_progress:
+            print(f"Processing single file: {pcap_files[0]}", file=sys.stderr)
+        
+        # Process ServerHello packets
+        if args.mode in ['server', 'both']:
+            try:
+                server_results = run_pyshark(pcap_files[0], max_workers=args.workers, show_progress=show_progress, chunk_size=args.chunk_size, buffer_size=args.buffer_size)
+            except ImportError:
+                print("pyshark not available. Please install pyshark: pip install pyshark", file=sys.stderr)
+                sys.exit(1)
+
+            if not server_results:
+                print("No TLS ServerHello packets found or parsing failed.", file=sys.stderr)
+                if args.mode == 'server':
+                    sys.exit(2)
+            else:
+                # Output ServerHello statistics to stdout
+                print_statistics(server_results)
+                
+                # Save ServerHello JSON
+                server_json_path = f"{results_dir}/server_results.json"
+                with open(server_json_path, 'w', encoding='utf-8') as f:
+                    json.dump([asdict(r) for r in server_results], f, ensure_ascii=False, indent=2)
+                print(f"ServerHello JSON saved to: {server_json_path}", file=sys.stderr)
+                
+                # Save ServerHello detailed table
+                server_table_path = f"{results_dir}/server_results.txt"
+                with open(server_table_path, 'w', encoding='utf-8') as f:
+                    from shutil import get_terminal_size
+                    width = get_terminal_size((120, 20)).columns
+
+                    f.write("=" * width + "\n")
+                    f.write("ServerHello Detailed Table\n")
+                    f.write("=" * width + "\n")
+                    f.write(f"{'Frame':>6}  {'Src':<35}  {'Dst':<35}  {'TLS':<8}  {'PQC':<4}  {'NamedGroup(s)':<20}  {'CipherSuite':<12}  {'CipherName':<30}\n")
+                    f.write("-" * width + "\n")
+                    for r in server_results:
+                        ids = ",".join(r.named_group_ids) if r.named_group_ids else "-"
+                        name = "/".join(r.named_group_names) if r.named_group_names else "-"
+                        ng = f"{ids} ({name})" if ids != "-" else "-"
+                        cipher_hex = str(r.cipher_suite or '-')
+                        cipher_name = str(r.cipher_suite_name or '-')
+                        f.write(f"{str(r.frame or '-'):>6}  {str(r.src or '-'):<35}  {str(r.dst or '-'):<35}  {str(r.tls_version or '-'):<8}  {str(r.pqc):<4}  {ng:<20}  {cipher_hex:<12}  {cipher_name:<30}\n")
+                    f.write("=" * width + "\n")
+                print(f"ServerHello table saved to: {server_table_path}", file=sys.stderr)
+                
+                # Save ServerHello summary
+                server_summary_path = f"{results_dir}/server_summary.txt"
+                with open(server_summary_path, 'w', encoding='utf-8') as f:
+                    # Capture stdout for statistics
+                    import io
+                    from contextlib import redirect_stdout
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        print_statistics(server_results)
+                    f.write(output.getvalue())
+                print(f"ServerHello summary saved to: {server_summary_path}", file=sys.stderr)
+
+        # Process ClientHello packets
+        if args.mode in ['client', 'both']:
+            try:
+                client_results = run_pyshark_client_hello_streaming(pcap_files[0], max_workers=args.workers, show_progress=show_progress, chunk_size=args.chunk_size, buffer_size=args.buffer_size)
+            except ImportError:
+                print("pyshark not available. Please install pyshark: pip install pyshark", file=sys.stderr)
+                sys.exit(1)
+
+            if not client_results:
+                print("No TLS ClientHello packets found or parsing failed.", file=sys.stderr)
+                if args.mode == 'client':
+                    sys.exit(2)
+            else:
+                # Output ClientHello statistics to stdout
+                print_client_hello_statistics(client_results)
+                
+                # Save ClientHello JSON
+                client_json_path = f"{results_dir}/client_results.json"
+                with open(client_json_path, 'w', encoding='utf-8') as f:
+                    json.dump([asdict(r) for r in client_results], f, ensure_ascii=False, indent=2)
+                print(f"ClientHello JSON saved to: {client_json_path}", file=sys.stderr)
+                
+                # Save ClientHello detailed table
+                client_table_path = f"{results_dir}/client_results.txt"
+                with open(client_table_path, 'w', encoding='utf-8') as f:
+                    from shutil import get_terminal_size
+                    width = get_terminal_size((120, 20)).columns
+
+                    f.write("=" * width + "\n")
+                    f.write("ClientHello Detailed Table\n")
+                    f.write("=" * width + "\n")
+                    f.write(f"{'Frame':>6}  {'Src':<35}  {'Dst':<35}  {'TLS':<8}  {'PQC':<4}  {'SupportedGroups':<30}  {'KeyShareGroups':<30}  {'SignatureAlgs':<30}\n")
+                    f.write("-" * width + "\n")
+                    for r in client_results:
+                        supported_groups = ",".join(r.supported_group_names) if r.supported_group_names else "-"
+                        key_share_groups = ",".join(r.key_share_group_names) if r.key_share_group_names else "-"
+                        signature_algs = ",".join(r.signature_algorithm_names) if r.signature_algorithm_names else "-"
+                        f.write(f"{str(r.frame or '-'):>6}  {str(r.src or '-'):<35}  {str(r.dst or '-'):<35}  {str(r.tls_version or '-'):<8}  {str(r.pqc_any):<4}  {supported_groups:<30}  {key_share_groups:<30}  {signature_algs:<30}\n")
+                    f.write("=" * width + "\n")
+                print(f"ClientHello table saved to: {client_table_path}", file=sys.stderr)
+                
+                # Save ClientHello summary
+                client_summary_path = f"{results_dir}/client_summary.txt"
+                with open(client_summary_path, 'w', encoding='utf-8') as f:
+                    # Capture stdout for statistics
+                    import io
+                    from contextlib import redirect_stdout
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        print_client_hello_statistics(client_results)
+                    f.write(output.getvalue())
+                print(f"ClientHello summary saved to: {client_summary_path}", file=sys.stderr)
+    
+    else:
+        # Multiple file processing (new parallel processing functionality)
+        if show_progress:
+            print(f"Processing {len(pcap_files)} pcap files in parallel", file=sys.stderr)
+        
         try:
-            server_results = run_pyshark(args.pcap, max_workers=args.workers, show_progress=show_progress, chunk_size=args.chunk_size, buffer_size=args.buffer_size)
+            # Process multiple pcap files in parallel
+            server_results, client_results = process_pcap_files_batch(
+                pcap_files, 
+                max_processes=args.processes,
+                max_workers=args.workers,
+                mode=args.mode,
+                chunk_size=args.chunk_size,
+                buffer_size=args.buffer_size,
+                show_progress=show_progress
+            )
+            
+            # Process ServerHello packets
+            if args.mode in ['server', 'both'] and server_results:
+                # Output ServerHello statistics to stdout
+                print_statistics(server_results)
+                
+                # Save ServerHello JSON
+                server_json_path = f"{results_dir}/server_results.json"
+                with open(server_json_path, 'w', encoding='utf-8') as f:
+                    json.dump([asdict(r) for r in server_results], f, ensure_ascii=False, indent=2)
+                print(f"ServerHello JSON saved to: {server_json_path}", file=sys.stderr)
+                
+                # Save ServerHello detailed table
+                server_table_path = f"{results_dir}/server_results.txt"
+                with open(server_table_path, 'w', encoding='utf-8') as f:
+                    from shutil import get_terminal_size
+                    width = get_terminal_size((120, 20)).columns
+
+                    f.write("=" * width + "\n")
+                    f.write("ServerHello Detailed Table (Multiple Files)\n")
+                    f.write("=" * width + "\n")
+                    f.write(f"{'Frame':>6}  {'Src':<35}  {'Dst':<35}  {'TLS':<8}  {'PQC':<4}  {'NamedGroup(s)':<20}  {'CipherSuite':<12}  {'CipherName':<30}\n")
+                    f.write("-" * width + "\n")
+                    for r in server_results:
+                        ids = ",".join(r.named_group_ids) if r.named_group_ids else "-"
+                        name = "/".join(r.named_group_names) if r.named_group_names else "-"
+                        ng = f"{ids} ({name})" if ids != "-" else "-"
+                        cipher_hex = str(r.cipher_suite or '-')
+                        cipher_name = str(r.cipher_suite_name or '-')
+                        f.write(f"{str(r.frame or '-'):>6}  {str(r.src or '-'):<35}  {str(r.dst or '-'):<35}  {str(r.tls_version or '-'):<8}  {str(r.pqc):<4}  {ng:<20}  {cipher_hex:<12}  {cipher_name:<30}\n")
+                    f.write("=" * width + "\n")
+                print(f"ServerHello table saved to: {server_table_path}", file=sys.stderr)
+                
+                # Save ServerHello summary
+                server_summary_path = f"{results_dir}/server_summary.txt"
+                with open(server_summary_path, 'w', encoding='utf-8') as f:
+                    # Capture stdout for statistics
+                    import io
+                    from contextlib import redirect_stdout
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        print_statistics(server_results)
+                    f.write(output.getvalue())
+                print(f"ServerHello summary saved to: {server_summary_path}", file=sys.stderr)
+            elif args.mode in ['server', 'both']:
+                print("No TLS ServerHello packets found in any files.", file=sys.stderr)
+
+            # Process ClientHello packets
+            if args.mode in ['client', 'both'] and client_results:
+                # Output ClientHello statistics to stdout
+                print_client_hello_statistics(client_results)
+                
+                # Save ClientHello JSON
+                client_json_path = f"{results_dir}/client_results.json"
+                with open(client_json_path, 'w', encoding='utf-8') as f:
+                    json.dump([asdict(r) for r in client_results], f, ensure_ascii=False, indent=2)
+                print(f"ClientHello JSON saved to: {client_json_path}", file=sys.stderr)
+                
+                # Save ClientHello detailed table
+                client_table_path = f"{results_dir}/client_results.txt"
+                with open(client_table_path, 'w', encoding='utf-8') as f:
+                    from shutil import get_terminal_size
+                    width = get_terminal_size((120, 20)).columns
+
+                    f.write("=" * width + "\n")
+                    f.write("ClientHello Detailed Table (Multiple Files)\n")
+                    f.write("=" * width + "\n")
+                    f.write(f"{'Frame':>6}  {'Src':<35}  {'Dst':<35}  {'TLS':<8}  {'PQC':<4}  {'SupportedGroups':<30}  {'KeyShareGroups':<30}  {'SignatureAlgs':<30}\n")
+                    f.write("-" * width + "\n")
+                    for r in client_results:
+                        supported_groups = ",".join(r.supported_group_names) if r.supported_group_names else "-"
+                        key_share_groups = ",".join(r.key_share_group_names) if r.key_share_group_names else "-"
+                        signature_algs = ",".join(r.signature_algorithm_names) if r.signature_algorithm_names else "-"
+                        f.write(f"{str(r.frame or '-'):>6}  {str(r.src or '-'):<35}  {str(r.dst or '-'):<35}  {str(r.tls_version or '-'):<8}  {str(r.pqc_any):<4}  {supported_groups:<30}  {key_share_groups:<30}  {signature_algs:<30}\n")
+                    f.write("=" * width + "\n")
+                print(f"ClientHello table saved to: {client_table_path}", file=sys.stderr)
+                
+                # Save ClientHello summary
+                client_summary_path = f"{results_dir}/client_summary.txt"
+                with open(client_summary_path, 'w', encoding='utf-8') as f:
+                    # Capture stdout for statistics
+                    import io
+                    from contextlib import redirect_stdout
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        print_client_hello_statistics(client_results)
+                    f.write(output.getvalue())
+                print(f"ClientHello summary saved to: {client_summary_path}", file=sys.stderr)
+            elif args.mode in ['client', 'both']:
+                print("No TLS ClientHello packets found in any files.", file=sys.stderr)
+                
         except ImportError:
             print("pyshark not available. Please install pyshark: pip install pyshark", file=sys.stderr)
             sys.exit(1)
-
-        if not server_results:
-            print("No TLS ServerHello packets found or parsing failed.", file=sys.stderr)
-            if args.mode == 'server':
-                sys.exit(2)
-        else:
-            # Output ServerHello statistics to stdout
-            print_statistics(server_results)
-            
-            # Save ServerHello JSON
-            server_json_path = f"{results_dir}/server_results.json"
-            with open(server_json_path, 'w', encoding='utf-8') as f:
-                json.dump([asdict(r) for r in server_results], f, ensure_ascii=False, indent=2)
-            print(f"ServerHello JSON saved to: {server_json_path}", file=sys.stderr)
-            
-            # Save ServerHello detailed table
-            server_table_path = f"{results_dir}/server_results.txt"
-            with open(server_table_path, 'w', encoding='utf-8') as f:
-                from shutil import get_terminal_size
-                width = get_terminal_size((120, 20)).columns
-
-                f.write("=" * width + "\n")
-                f.write("ServerHello Detailed Table\n")
-                f.write("=" * width + "\n")
-                f.write(f"{'Frame':>6}  {'Src':<35}  {'Dst':<35}  {'TLS':<8}  {'PQC':<4}  {'NamedGroup(s)':<20}  {'CipherSuite':<12}  {'CipherName':<30}\n")
-                f.write("-" * width + "\n")
-                for r in server_results:
-                    ids = ",".join(r.named_group_ids) if r.named_group_ids else "-"
-                    name = "/".join(r.named_group_names) if r.named_group_names else "-"
-                    ng = f"{ids} ({name})" if ids != "-" else "-"
-                    cipher_hex = str(r.cipher_suite or '-')
-                    cipher_name = str(r.cipher_suite_name or '-')
-                    f.write(f"{str(r.frame or '-'):>6}  {str(r.src or '-'):<35}  {str(r.dst or '-'):<35}  {str(r.tls_version or '-'):<8}  {str(r.pqc):<4}  {ng:<20}  {cipher_hex:<12}  {cipher_name:<30}\n")
-                f.write("=" * width + "\n")
-            print(f"ServerHello table saved to: {server_table_path}", file=sys.stderr)
-            
-            # Save ServerHello summary
-            server_summary_path = f"{results_dir}/server_summary.txt"
-            with open(server_summary_path, 'w', encoding='utf-8') as f:
-                # Capture stdout for statistics
-                import io
-                from contextlib import redirect_stdout
-                output = io.StringIO()
-                with redirect_stdout(output):
-                    print_statistics(server_results)
-                f.write(output.getvalue())
-            print(f"ServerHello summary saved to: {server_summary_path}", file=sys.stderr)
-
-    # Process ClientHello packets
-    if args.mode in ['client', 'both']:
-        try:
-            client_results = run_pyshark_client_hello_streaming(args.pcap, max_workers=args.workers, show_progress=show_progress, chunk_size=args.chunk_size, buffer_size=args.buffer_size)
-        except ImportError:
-            print("pyshark not available. Please install pyshark: pip install pyshark", file=sys.stderr)
+        except Exception as e:
+            print(f"Error processing files: {e}", file=sys.stderr)
             sys.exit(1)
-
-        if not client_results:
-            print("No TLS ClientHello packets found or parsing failed.", file=sys.stderr)
-            if args.mode == 'client':
-                sys.exit(2)
-        else:
-            # Output ClientHello statistics to stdout
-            print_client_hello_statistics(client_results)
-            
-            # Save ClientHello JSON
-            client_json_path = f"{results_dir}/client_results.json"
-            with open(client_json_path, 'w', encoding='utf-8') as f:
-                json.dump([asdict(r) for r in client_results], f, ensure_ascii=False, indent=2)
-            print(f"ClientHello JSON saved to: {client_json_path}", file=sys.stderr)
-            
-            # Save ClientHello detailed table
-            client_table_path = f"{results_dir}/client_results.txt"
-            with open(client_table_path, 'w', encoding='utf-8') as f:
-                from shutil import get_terminal_size
-                width = get_terminal_size((120, 20)).columns
-
-                f.write("=" * width + "\n")
-                f.write("ClientHello Detailed Table\n")
-                f.write("=" * width + "\n")
-                f.write(f"{'Frame':>6}  {'Src':<35}  {'Dst':<35}  {'TLS':<8}  {'PQC':<4}  {'SupportedGroups':<30}  {'KeyShareGroups':<30}  {'SignatureAlgs':<30}\n")
-                f.write("-" * width + "\n")
-                for r in client_results:
-                    supported_groups = ",".join(r.supported_group_names) if r.supported_group_names else "-"
-                    key_share_groups = ",".join(r.key_share_group_names) if r.key_share_group_names else "-"
-                    signature_algs = ",".join(r.signature_algorithm_names) if r.signature_algorithm_names else "-"
-                    f.write(f"{str(r.frame or '-'):>6}  {str(r.src or '-'):<35}  {str(r.dst or '-'):<35}  {str(r.tls_version or '-'):<8}  {str(r.pqc_any):<4}  {supported_groups:<30}  {key_share_groups:<30}  {signature_algs:<30}\n")
-                f.write("=" * width + "\n")
-            print(f"ClientHello table saved to: {client_table_path}", file=sys.stderr)
-            
-            # Save ClientHello summary
-            client_summary_path = f"{results_dir}/client_summary.txt"
-            with open(client_summary_path, 'w', encoding='utf-8') as f:
-                # Capture stdout for statistics
-                import io
-                from contextlib import redirect_stdout
-                output = io.StringIO()
-                with redirect_stdout(output):
-                    print_client_hello_statistics(client_results)
-                f.write(output.getvalue())
-            print(f"ClientHello summary saved to: {client_summary_path}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
