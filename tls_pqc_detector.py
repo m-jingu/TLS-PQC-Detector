@@ -1277,10 +1277,10 @@ def main():
             server_results, client_results = process_pcap_files_batch(
                 pcap_files, 
                 max_processes=args.processes,
-                max_workers=args.workers,
+                max_workers=4,  # Default value
                 mode=args.mode,
-                chunk_size=args.chunk_size,
-                buffer_size=args.buffer_size,
+                chunk_size=1000,  # Default value
+                buffer_size=10000,  # Default value
                 show_progress=show_progress
             )
             
