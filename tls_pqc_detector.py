@@ -27,8 +27,8 @@ import multiprocessing as mp
 from pathlib import Path
 from config import (
     PQC_NAMED_GROUPS, CLASSICAL_NAMED_GROUPS, PQC_SIGNATURE_ALGORITHMS,
-    CIPHER_SUITES, TLS_VERSION_PATTERNS, DEFAULT_WORKERS, 
-    DEFAULT_CHUNK_SIZE, DEFAULT_BUFFER_SIZE, DEFAULT_MODE
+    CIPHER_SUITES, TLS_VERSION_PATTERNS, 
+    DEFAULT_MODE, GREASE_VALUES
 )
 
 
@@ -94,10 +94,7 @@ class ParallelPcapProcessor:
             if mode in ['server', 'both']:
                 server_results = run_pyshark_streaming(
                     pcap_file, 
-                    max_workers=self.max_workers,
-                    show_progress=False,  # Hide individual progress
-                    chunk_size=self.chunk_size,
-                    buffer_size=self.buffer_size
+                    show_progress=False  # Hide individual progress
                 )
                 # Apply frame number offset
                 for result in server_results:
@@ -107,10 +104,7 @@ class ParallelPcapProcessor:
             if mode in ['client', 'both']:
                 client_results = run_pyshark_client_hello_streaming(
                     pcap_file,
-                    max_workers=self.max_workers,
-                    show_progress=False,  # Hide individual progress
-                    chunk_size=self.chunk_size,
-                    buffer_size=self.buffer_size
+                    show_progress=False  # Hide individual progress
                 )
                 # Apply frame number offset
                 for result in client_results:
@@ -373,10 +367,18 @@ def process_client_hello_optimized(pkt, tls_version_patterns) -> Optional[Client
         tls_layer = getattr(pkt, "tls", None)
         if not tls_layer:
             return None
+        
+        # Check if this is a ClientHello packet
+        handshake_type = getattr(tls_layer, 'handshake_type', None)
+        if handshake_type != '1':
+            return None
+        
+        
 
         # Detect TLS version
         tls_version = "unknown"
         
+        # First try supported_version extension (TLS 1.3)
         supported_ver = None
         try:
             supported_ver = tls_layer.handshake_extensions_supported_version
@@ -387,12 +389,53 @@ def process_client_hello_optimized(pkt, tls_version_patterns) -> Optional[Client
                 pass
             
         if supported_ver:
-            supported_ver_str = str(supported_ver)
-            for version, pattern in tls_version_patterns.items():
-                if pattern.search(supported_ver_str):
-                    tls_version = version
-                    break
+            # Handle LayerFieldsContainer (pyshark specific)
+            if hasattr(supported_ver, 'all_fields'):
+                versions = []
+                for field in supported_ver.all_fields:
+                    if hasattr(field, 'show'):
+                        versions.append(field.show)
+                    elif hasattr(field, 'value'):
+                        versions.append(field.value)
+                    else:
+                        versions.append(str(field))
+                
+                for ver_str in versions:
+                    # Skip GREASE values
+                    ver_int = _hex_to_int(ver_str)
+                    if ver_int is not None and ver_int in GREASE_VALUES:
+                        continue
+                    for version, pattern in tls_version_patterns.items():
+                        if pattern.search(ver_str):
+                            tls_version = version
+                            break
+                    if tls_version != "unknown":
+                        break
+            # Handle both single values and lists
+            elif isinstance(supported_ver, list):
+                for ver in supported_ver:
+                    ver_str = str(ver)
+                    # Skip GREASE values
+                    ver_int = _hex_to_int(ver_str)
+                    if ver_int is not None and ver_int in GREASE_VALUES:
+                        continue
+                    for version, pattern in tls_version_patterns.items():
+                        if pattern.search(ver_str):
+                            tls_version = version
+                            break
+                    if tls_version != "unknown":
+                        break
+            else:
+                supported_ver_str = str(supported_ver)
+                # Skip GREASE values for single values too
+                ver_int = _hex_to_int(supported_ver_str)
+                if ver_int is None or ver_int not in GREASE_VALUES:
+                    for version, pattern in tls_version_patterns.items():
+                        if pattern.search(supported_ver_str):
+                            tls_version = version
+                            break
         
+        # If still unknown, try record version (TLS 1.2 and below)
         if tls_version == "unknown":
             record_ver = None
             try:
@@ -410,17 +453,61 @@ def process_client_hello_optimized(pkt, tls_version_patterns) -> Optional[Client
                         tls_version = version
                         break
 
-        # Extract supported groups - try different approaches
+        # Extract supported groups - comprehensive approach
         supported_groups = []
         try:
-            # Try the singular form first
-            if hasattr(tls_layer, 'handshake_extensions_supported_group'):
-                field = tls_layer.handshake_extensions_supported_group
-                if field:
-                    if isinstance(field, list):
-                        supported_groups.extend([str(v) for v in field if v])
-                    else:
-                        supported_groups.append(str(field))
+            # Try multiple field names for supported groups
+            supported_group_fields = [
+                'handshake_extensions_supported_group',
+                'handshake_extensions_supported_groups',
+                'handshake_extensions_supported_groups_group',
+                'handshake_extensions_supported_groups_list'
+            ]
+            
+            for field_name in supported_group_fields:
+                if hasattr(tls_layer, field_name):
+                    field = getattr(tls_layer, field_name)
+                    if field:
+                        # Handle LayerFieldsContainer (pyshark specific)
+                        if hasattr(field, 'all_fields'):
+                            for subfield in field.all_fields:
+                                if hasattr(subfield, 'show'):
+                                    supported_groups.append(subfield.show)
+                                elif hasattr(subfield, 'value'):
+                                    supported_groups.append(subfield.value)
+                                else:
+                                    supported_groups.append(str(subfield))
+                        elif isinstance(field, list):
+                            supported_groups.extend([str(v) for v in field if v])
+                        else:
+                            supported_groups.append(str(field))
+                        break
+            
+            # Try alternative field names
+            for field_name in [
+                "tls.handshake.extensions.supported_groups_group",
+                "tls.handshake.extensions.supported_groups_list",
+                "tls.handshake.extensions.supported_groups_group_list"
+            ]:
+                try:
+                    field = tls_layer.get_field(field_name)
+                    if field:
+                        # Handle LayerFieldsContainer (pyshark specific)
+                        if hasattr(field, 'all_fields'):
+                            for subfield in field.all_fields:
+                                if hasattr(subfield, 'show'):
+                                    supported_groups.append(subfield.show)
+                                elif hasattr(subfield, 'value'):
+                                    supported_groups.append(subfield.value)
+                                else:
+                                    supported_groups.append(str(subfield))
+                        elif isinstance(field, list):
+                            supported_groups.extend([str(v) for v in field if v])
+                        else:
+                            supported_groups.append(str(field))
+                        break
+                except:
+                    continue
             
             # Try to get individual group fields directly
             for i in range(10):  # Try up to 10 groups
@@ -432,26 +519,19 @@ def process_client_hello_optimized(pkt, tls_version_patterns) -> Optional[Client
                 except:
                     pass
             
-            # Try alternative naming patterns
-            for pattern in [
-                "tls.handshake.extensions.supported_groups_group",
-                "tls.handshake.extensions.supported_groups_list",
-                "tls.handshake.extensions.supported_groups_group_list"
-            ]:
-                try:
-                    field = tls_layer.get_field(pattern)
-                    if field:
-                        if isinstance(field, list):
-                            supported_groups.extend([str(v) for v in field if v])
-                        else:
-                            supported_groups.append(str(field))
-                except:
-                    pass
-            
             # Try to access the container and look for sub-fields
             if hasattr(tls_layer, 'handshake_extensions_supported_groups'):
                 field = tls_layer.handshake_extensions_supported_groups
                 if field:
+                    # Handle LayerFieldsContainer (pyshark specific)
+                    if hasattr(field, 'all_fields'):
+                        for subfield in field.all_fields:
+                            if hasattr(subfield, 'show'):
+                                supported_groups.append(subfield.show)
+                            elif hasattr(subfield, 'value'):
+                                supported_groups.append(subfield.value)
+                            else:
+                                supported_groups.append(str(subfield))
                     # Try to access fields attribute
                     try:
                         if hasattr(field, 'fields'):
@@ -472,6 +552,10 @@ def process_client_hello_optimized(pkt, tls_version_patterns) -> Optional[Client
                     except:
                         pass
             
+            # Remove duplicates and empty values while preserving order
+            seen = set()
+            supported_groups = [x for x in supported_groups if x and x.strip() and not (x in seen or seen.add(x))]
+            
         except:
             pass
 
@@ -482,7 +566,16 @@ def process_client_hello_optimized(pkt, tls_version_patterns) -> Optional[Client
             if hasattr(tls_layer, 'handshake_extensions_key_share_group'):
                 field = tls_layer.handshake_extensions_key_share_group
                 if field:
-                    if isinstance(field, list):
+                    # Handle LayerFieldsContainer (pyshark specific)
+                    if hasattr(field, 'all_fields'):
+                        for subfield in field.all_fields:
+                            if hasattr(subfield, 'show'):
+                                key_share_groups.append(subfield.show)
+                            elif hasattr(subfield, 'value'):
+                                key_share_groups.append(subfield.value)
+                            else:
+                                key_share_groups.append(str(subfield))
+                    elif isinstance(field, list):
                         key_share_groups.extend([str(v) for v in field if v])
                     else:
                         key_share_groups.append(str(field))
@@ -498,7 +591,16 @@ def process_client_hello_optimized(pkt, tls_version_patterns) -> Optional[Client
                 try:
                     field = tls_layer.get_field(field_name)
                     if field:
-                        if isinstance(field, list):
+                        # Handle LayerFieldsContainer (pyshark specific)
+                        if hasattr(field, 'all_fields'):
+                            for subfield in field.all_fields:
+                                if hasattr(subfield, 'show'):
+                                    key_share_groups.append(subfield.show)
+                                elif hasattr(subfield, 'value'):
+                                    key_share_groups.append(subfield.value)
+                                else:
+                                    key_share_groups.append(str(subfield))
+                        elif isinstance(field, list):
                             key_share_groups.extend([str(v) for v in field if v])
                         else:
                             key_share_groups.append(str(field))
@@ -506,6 +608,9 @@ def process_client_hello_optimized(pkt, tls_version_patterns) -> Optional[Client
                 except:
                     continue
             
+            # Remove duplicates while preserving order
+            seen = set()
+            key_share_groups = [x for x in key_share_groups if not (x in seen or seen.add(x))]
             
         except:
             pass
@@ -553,14 +658,14 @@ def process_client_hello_optimized(pkt, tls_version_patterns) -> Optional[Client
         for g in supported_groups:
             if g and g != "None":
                 gi_val = _hex_to_int(str(g))
-                if gi_val is not None:
+                if gi_val is not None and gi_val not in GREASE_VALUES:
                     supported_group_ints.append(gi_val)
 
         key_share_group_ints = []
         for g in key_share_groups:
             if g and g != "None":
                 gi_val = _hex_to_int(str(g))
-                if gi_val is not None:
+                if gi_val is not None and gi_val not in GREASE_VALUES:
                     key_share_group_ints.append(gi_val)
 
         signature_algorithm_ints = []
@@ -630,6 +735,11 @@ def process_packet_optimized(pkt, tls_version_patterns) -> Optional[ServerHelloI
         # Get TLS layer
         tls_layer = getattr(pkt, "tls", None)
         if not tls_layer:
+            return None
+        
+        # Check if this is a ServerHello packet
+        handshake_type = getattr(tls_layer, 'handshake_type', None)
+        if handshake_type != '2':
             return None
             
         # Extract cipher suite
@@ -716,236 +826,85 @@ def process_packet_optimized(pkt, tls_version_patterns) -> Optional[ServerHelloI
     except Exception as e:
         return None
 
-def run_pyshark_client_hello_streaming(pcap: str, max_workers: int = 4, show_progress: bool = True, chunk_size: int = 50, buffer_size: int = 20000) -> List[ClientHelloInfo]:
-    """Optimized streaming processing for TLS ClientHello detection."""
+def run_pyshark_client_hello_streaming(pcap: str, show_progress: bool = True) -> List[ClientHelloInfo]:
+    """Single-threaded processing for TLS ClientHello detection."""
     import pyshark
-    from queue import Queue
-    import threading
     import time
     import re
     
     results = []
-    packet_queue = Queue(maxsize=buffer_size * 2)
-    results_lock = threading.Lock()
-    processed_count = 0
-    total_packets = 0
     start_time = time.time()
     
     # Pre-compile regex patterns for faster processing
     tls_version_patterns = {k: re.compile(v) for k, v in TLS_VERSION_PATTERNS.items()}
     
-    def packet_reader():
-        nonlocal total_packets
-        cap = pyshark.FileCapture(
-            pcap, 
-            display_filter="tls.handshake.type == 1",  # ClientHello
-            keep_packets=False,
-            use_json=False,
-            include_raw=False,
-            override_prefs={
-                'tls.desegment_ssl_records': 'FALSE',
-                'tls.desegment_ssl_application_data': 'FALSE',
-                'tls.keylog_file': '',
-                'tls.debug_file': ''
-            }
-        )
-        try:
-            for pkt in cap:
-                packet_queue.put(pkt)
-                total_packets += 1
-                
-                if show_progress and total_packets % 1000 == 0:
-                    elapsed = time.time() - start_time
-                    rate = total_packets / elapsed if elapsed > 0 else 0
-                    print(f"Read: {total_packets} packets (Speed: {rate:.1f} pkt/s)", file=sys.stderr)
-        except Exception as e:
-            print(f"Packet reading error: {e}", file=sys.stderr)
-        finally:
-            try:
-                cap.close()
-            except:
-                pass
-            packet_queue.put(None)  # Signal end of packets
-    
-    def packet_processor():
-        nonlocal processed_count
-        effective_workers = min(max_workers * 2, 16)
-        
-        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-            futures = []
-            batch_count = 0
-            
-            while True:
-                batch = []
-                
-                for _ in range(chunk_size):
-                    try:
-                        pkt = packet_queue.get(timeout=1.0)
-                        if pkt is None:
-                            break
-                        batch.append(pkt)
-                    except:
-                        break
-                
-                if not batch:
-                    break
-                
-                batch_count += 1
-                
-                batch_futures = [executor.submit(process_client_hello_optimized, pkt, tls_version_patterns) for pkt in batch]
-                
-                # Process futures without timeout to avoid blocking
-                for future in batch_futures:
-                    try:
-                        result = future.result(timeout=0.1)
-                        if result is not None:
-                            with results_lock:
-                                results.append(result)
-                    except Exception as e:
-                        pass
-                    
-                    processed_count += 1
-                    if show_progress and processed_count % 1000 == 0:
-                        elapsed = time.time() - start_time
-                        rate = processed_count / elapsed if elapsed > 0 else 0
-                        print(f"Processed: {processed_count} packets (Speed: {rate:.1f} pkt/s)", file=sys.stderr)
-    
     if show_progress:
-        print(f"Streaming ClientHello packets... (Chunk size: {chunk_size}, Workers: {max_workers})", file=sys.stderr)
+        print(f"Processing ClientHello packets from {pcap}...", file=sys.stderr)
     
-    processor_thread = threading.Thread(target=packet_processor)
-    processor_thread.start()
+    # Use the exact same approach as direct testing
+    cap = pyshark.FileCapture(pcap, display_filter='tls')
     
-    reader_thread = threading.Thread(target=packet_reader)
-    reader_thread.start()
-    
-    reader_thread.join()
-    processor_thread.join()
+    try:
+        for pkt in cap:
+            # Process all TLS packets - let process_client_hello_optimized handle the filtering
+            result = process_client_hello_optimized(pkt, tls_version_patterns)
+            if result is not None:
+                results.append(result)
+    except Exception as e:
+        print(f"Packet processing error: {e}", file=sys.stderr)
+    finally:
+        try:
+            cap.close()
+        except:
+            pass
     
     if show_progress:
         elapsed = time.time() - start_time
-        rate = total_packets / elapsed if elapsed > 0 else 0
-        print(f"Analysis complete: {len(results)} ClientHello packets detected (Total time: {elapsed:.1f}s, Average speed: {rate:.1f} pkt/s)", file=sys.stderr)
+        print(f"Analysis complete: {len(results)} ClientHello packets detected (Total time: {elapsed:.1f}s)", file=sys.stderr)
     
     return results
 
-def run_pyshark_streaming(pcap: str, max_workers: int = 4, show_progress: bool = True, chunk_size: int = 50, buffer_size: int = 20000) -> List[ServerHelloInfo]:
-    """Optimized streaming processing for TLS PQC detection."""
+def run_pyshark_streaming(pcap: str, show_progress: bool = True) -> List[ServerHelloInfo]:
+    """Single-threaded processing for TLS PQC detection."""
     import pyshark
-    from queue import Queue
-    import threading
     import time
     import re
     
     results = []
-    packet_queue = Queue(maxsize=buffer_size * 2)
-    results_lock = threading.Lock()
-    processed_count = 0
-    total_packets = 0
     start_time = time.time()
     
     # Pre-compile regex patterns for faster processing
     tls_version_patterns = {k: re.compile(v) for k, v in TLS_VERSION_PATTERNS.items()}
     
-    def packet_reader():
-        nonlocal total_packets
-        cap = pyshark.FileCapture(
-            pcap, 
-            display_filter="tls.handshake.type == 2", 
-            keep_packets=False,
-            use_json=False,
-            include_raw=False,
-            override_prefs={
-                'tls.desegment_ssl_records': 'FALSE',
-                'tls.desegment_ssl_application_data': 'FALSE',
-                'tls.keylog_file': '',
-                'tls.debug_file': ''
-            }
-        )
-        try:
-            for pkt in cap:
-                packet_queue.put(pkt)
-                total_packets += 1
-                
-                
-                if show_progress and total_packets % 1000 == 0:
-                    elapsed = time.time() - start_time
-                    rate = total_packets / elapsed if elapsed > 0 else 0
-                    print(f"Read: {total_packets} packets (Speed: {rate:.1f} pkt/s)", file=sys.stderr)
-        except Exception as e:
-            print(f"Packet reading error: {e}", file=sys.stderr)
-        finally:
-            try:
-                cap.close()
-            except:
-                pass
-            packet_queue.put(None)  # Signal end of packets
-    
-    def packet_processor():
-        nonlocal processed_count
-        effective_workers = min(max_workers * 2, 16)
-        
-        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-            futures = []
-            batch_count = 0
-            
-            while True:
-                batch = []
-                
-                for _ in range(chunk_size):
-                    try:
-                        pkt = packet_queue.get(timeout=1.0)
-                        if pkt is None:
-                            break
-                        batch.append(pkt)
-                    except:
-                        break
-                
-                if not batch:
-                    break
-                
-                batch_count += 1
-                
-                batch_futures = [executor.submit(process_packet_optimized, pkt, tls_version_patterns) for pkt in batch]
-                
-                # Process futures without timeout to avoid blocking
-                for future in batch_futures:
-                    try:
-                        result = future.result(timeout=0.1)
-                        if result is not None:
-                            with results_lock:
-                                results.append(result)
-                    except Exception as e:
-                        pass
-                    
-                    processed_count += 1
-                    if show_progress and processed_count % 1000 == 0:
-                        elapsed = time.time() - start_time
-                        rate = processed_count / elapsed if elapsed > 0 else 0
-                        print(f"Processed: {processed_count} packets (Speed: {rate:.1f} pkt/s)", file=sys.stderr)
-    
     if show_progress:
-        print(f"Streaming packets... (Chunk size: {chunk_size}, Workers: {max_workers})", file=sys.stderr)
+        print(f"Processing ServerHello packets from {pcap}...", file=sys.stderr)
     
-    processor_thread = threading.Thread(target=packet_processor)
-    processor_thread.start()
+    # Use the exact same approach as direct testing
+    cap = pyshark.FileCapture(pcap, display_filter='tls')
     
-    reader_thread = threading.Thread(target=packet_reader)
-    reader_thread.start()
-    
-    reader_thread.join()
-    processor_thread.join()
+    try:
+        for pkt in cap:
+            # Process all TLS packets - let process_packet_optimized handle the filtering
+            result = process_packet_optimized(pkt, tls_version_patterns)
+            if result is not None:
+                results.append(result)
+    except Exception as e:
+        print(f"Packet processing error: {e}", file=sys.stderr)
+    finally:
+        try:
+            cap.close()
+        except:
+            pass
     
     if show_progress:
         elapsed = time.time() - start_time
-        rate = total_packets / elapsed if elapsed > 0 else 0
-        print(f"Analysis complete: {len(results)} ServerHello packets detected (Total time: {elapsed:.1f}s, Average speed: {rate:.1f} pkt/s)", file=sys.stderr)
+        print(f"Analysis complete: {len(results)} ServerHello packets detected (Total time: {elapsed:.1f}s)", file=sys.stderr)
     
     return results
 
-def run_pyshark(pcap: str, max_workers: int = 4, show_progress: bool = True, chunk_size: int = 50, buffer_size: int = 20000) -> List[ServerHelloInfo]:
-    """Main function using optimized streaming processing."""
-    return run_pyshark_streaming(pcap, max_workers, show_progress, chunk_size, buffer_size)
+def run_pyshark(pcap: str, show_progress: bool = True) -> List[ServerHelloInfo]:
+    """Main function using single-threaded processing."""
+    return run_pyshark_streaming(pcap, show_progress)
 
 def print_statistics(results: List[ServerHelloInfo]) -> None:
     """Print statistics about the TLS ServerHello packets."""
@@ -976,14 +935,23 @@ def print_statistics(results: List[ServerHelloInfo]) -> None:
                 else:
                     classical_named_groups.add(group_name)
     
-    # CipherSuite statistics
-    cipher_suites = {}
+    # CipherName statistics
     cipher_names = {}
     for r in results:
-        if r.cipher_suite:
-            cipher_suites[r.cipher_suite] = cipher_suites.get(r.cipher_suite, 0) + 1
         if r.cipher_suite_name:
             cipher_names[r.cipher_suite_name] = cipher_names.get(r.cipher_suite_name, 0) + 1
+    
+    # PQC NamedGroups usage frequency
+    pqc_named_groups_usage = {}
+    for r in results:
+        if r.named_group_ids and r.pqc:
+            for group_id in r.named_group_ids:
+                # Convert hex string to int for lookup
+                group_int = int(group_id, 16)
+                group_name = PQC_NAMED_GROUPS.get(group_int, CLASSICAL_NAMED_GROUPS.get(group_int, f"unknown_{group_id}"))
+                # Check if it's a PQC group
+                if group_int in PQC_NAMED_GROUPS:
+                    pqc_named_groups_usage[group_name] = pqc_named_groups_usage.get(group_name, 0) + 1
     
     # Print statistics
     print("\n" + "=" * 80)
@@ -1014,23 +982,19 @@ def print_statistics(results: List[ServerHelloInfo]) -> None:
         for group in sorted(classical_named_groups):
             print(f"  - {group}")
     
-    print(f"\nCipherSuite statistics:")
-    print(f"  Total unique CipherSuites: {len(cipher_suites)}")
-    print(f"  Total unique CipherNames: {len(cipher_names)}")
-    
-    if cipher_suites:
-        print(f"\nCipherSuite usage frequency (top 10):")
-        sorted_ciphers = sorted(cipher_suites.items(), key=lambda x: x[1], reverse=True)
-        for cipher, count in sorted_ciphers[:10]:
+    if pqc_named_groups_usage:
+        print(f"\nPQC NamedGroups usage frequency (top 10):")
+        sorted_pqc_groups = sorted(pqc_named_groups_usage.items(), key=lambda x: x[1], reverse=True)
+        for group, count in sorted_pqc_groups[:10]:
             percentage = (count / total_packets) * 100
-            print(f"  {cipher}: {count} ({percentage:.1f}%)")
+            print(f"  {group}: {count} ({percentage:.1f}%)")
     
     if cipher_names:
         print(f"\nCipherName usage frequency (top 10):")
-        sorted_names = sorted(cipher_names.items(), key=lambda x: x[1], reverse=True)
-        for name, count in sorted_names[:10]:
+        sorted_cipher_names = sorted(cipher_names.items(), key=lambda x: x[1], reverse=True)
+        for cipher_name, count in sorted_cipher_names[:10]:
             percentage = (count / total_packets) * 100
-            print(f"  {name}: {count} ({percentage:.1f}%)")
+            print(f"  {cipher_name}: {count} ({percentage:.1f}%)")
     
     print("=" * 80)
 
@@ -1170,11 +1134,8 @@ def main():
     ap.add_argument("input", help="Input .pcap/.pcapng file, directory, or wildcard pattern")
     ap.add_argument("--mode", choices=['server', 'client', 'both'], default=DEFAULT_MODE, 
                    help="Analysis mode: server (ServerHello), client (ClientHello), or both (default: both)")
-    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Number of parallel workers per file (default: 8)")
     ap.add_argument("--processes", type=int, default=None, help="Number of parallel processes for multiple files (default: CPU count)")
     ap.add_argument("--no-progress", action="store_true", help="Disable progress output")
-    ap.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Chunk size for processing (default: 1000)")
-    ap.add_argument("--buffer-size", type=int, default=DEFAULT_BUFFER_SIZE, help="Buffer size for packet queue (default: 20000)")
     args = ap.parse_args()
 
     show_progress = not args.no_progress
@@ -1201,7 +1162,7 @@ def main():
         # Process ServerHello packets
         if args.mode in ['server', 'both']:
             try:
-                server_results = run_pyshark(pcap_files[0], max_workers=args.workers, show_progress=show_progress, chunk_size=args.chunk_size, buffer_size=args.buffer_size)
+                server_results = run_pyshark(pcap_files[0], show_progress=show_progress)
             except ImportError:
                 print("pyshark not available. Please install pyshark: pip install pyshark", file=sys.stderr)
                 sys.exit(1)
@@ -1256,7 +1217,7 @@ def main():
         # Process ClientHello packets
         if args.mode in ['client', 'both']:
             try:
-                client_results = run_pyshark_client_hello_streaming(pcap_files[0], max_workers=args.workers, show_progress=show_progress, chunk_size=args.chunk_size, buffer_size=args.buffer_size)
+                client_results = run_pyshark_client_hello_streaming(pcap_files[0], show_progress=show_progress)
             except ImportError:
                 print("pyshark not available. Please install pyshark: pip install pyshark", file=sys.stderr)
                 sys.exit(1)

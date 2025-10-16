@@ -155,6 +155,7 @@ Thumbs.db
 # IDE files
 .vscode/
 .idea/
+.cursor/
 *.sublime-project
 *.sublime-workspace
 *.code-workspace
